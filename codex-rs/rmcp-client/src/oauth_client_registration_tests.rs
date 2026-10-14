@@ -325,6 +325,7 @@ async fn verified_issuer_can_delegate_authorization_and_token_to_one_origin() ->
         .respond_with(|request: &Request| {
             let registration: Value = serde_json::from_slice(&request.body)
                 .expect("dynamic registration should contain JSON");
+            assert_eq!(registration["client_name"], json!("Claymore Piko"));
             ResponseTemplate::new(200).set_body_json(json!({
                 "client_id": "delegated-provider-client",
                 "redirect_uris": registration["redirect_uris"],
