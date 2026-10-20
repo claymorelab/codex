@@ -574,9 +574,10 @@ async fn guardian_answers_survive_compaction_and_eviction() -> Result<()> {
             .iter()
             .filter_map(|item| item["content"].as_array())
             .flatten()
+            // The original Grok Bot's 1 MB image cap shrinks the attached image.
             .any(|item| item["image_url"]
                 .as_str()
-                .is_some_and(|url| url.len() > 4 * 1024 * 1024))
+                .is_some_and(|url| url.len() <= 1024 * 1024 * 4 / 3 + 64))
     );
     let guardian = requests
         .iter()

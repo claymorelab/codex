@@ -441,7 +441,7 @@ async fn tool_result_history_keeps_originating_model_across_switch_and_replay() 
         assert_eq!(request_turn_id(request), turn_id);
     }
     for (index, (call_id, limit, dimensions)) in
-        [("call-a", 100, (1600, 1600)), ("call-b", 400, (2048, 2048))]
+        [("call-a", 100, (1024, 1024)), ("call-b", 400, (2048, 2048))]
             .into_iter()
             .enumerate()
     {
