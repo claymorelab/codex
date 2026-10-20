@@ -374,6 +374,10 @@ impl SessionState {
         self.history.set_token_usage_full(context_window);
     }
 
+    pub(crate) fn history_image_count(&self) -> usize {
+        self.history.image_count()
+    }
+
     pub(crate) fn get_total_token_usage(&self, server_reasoning_included: bool) -> i64 {
         self.history
             .get_total_token_usage(server_reasoning_included)

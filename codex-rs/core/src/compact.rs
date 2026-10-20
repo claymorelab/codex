@@ -36,6 +36,7 @@ use codex_analytics::CompactionTrigger;
 use codex_analytics::now_unix_seconds;
 use codex_context_fragments::AnnotatedContent;
 use codex_context_fragments::set_annotated_content;
+use codex_context_fragments::to_annotated_content;
 use codex_context_fragments::truncate_annotated_text;
 use codex_history::CodexHarnessMetadata;
 use codex_history::ResponseItemEnvelope;
@@ -49,6 +50,7 @@ use codex_protocol::models::AgentMessageInputContent;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ContentItemKind;
+use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
@@ -405,6 +407,7 @@ async fn run_compact_task_inner_impl(
 
     let mut new_history = build_compacted_history(Vec::new(), &user_messages, &summary_text);
     if let Some(summary_item) = new_history.last_mut() {
+        preserve_latest_image(&mut summary_item.item, history_snapshot.raw_items());
         // This replacement history skips `record_conversation_items`; only the appended summary
         // belongs to this compaction turn.
         summary_item.set_turn_id_if_missing(&turn_context.sub_id);
@@ -692,6 +695,54 @@ pub(crate) fn insert_initial_context_before_last_real_user_or_summary(
     }
 
     compacted_history
+}
+
+/// The original Grok Bot's note before the image it keeps across a summary
+/// (`SUMMARY_PRESERVED_IMAGE_NOTE`).
+const SUMMARY_PRESERVED_IMAGE_NOTE: &str = "[Latest screenshot]: The image below is the most recent screenshot from the summarized conversation, captured before the summary above was created. Use it to continue from the last known visual state; take a fresh screenshot if you need to confirm the current state.";
+
+/// Like the original Grok Bot, the summary keeps the most recent image of the compacted
+/// history, after the original's note, so the model still sees the last visual state.
+/// The compacted history otherwise drops every image.
+fn preserve_latest_image<'a>(
+    summary: &mut ResponseItem,
+    history: impl DoubleEndedIterator<Item = &'a ResponseItem>,
+) {
+    let latest = history.rev().find_map(|item| match item {
+        ResponseItem::Message { content, .. } => content.iter().rev().find_map(|part| match part {
+            ContentItem::InputImage { image, detail } => Some((image.clone(), *detail)),
+            _ => None,
+        }),
+        ResponseItem::FunctionCallOutput { output, .. }
+        | ResponseItem::CustomToolCallOutput { output, .. } => output
+            .content_items()?
+            .iter()
+            .rev()
+            .find_map(|part| match part {
+                FunctionCallOutputContentItem::InputImage { image, detail } => {
+                    Some((image.clone(), *detail))
+                }
+                _ => None,
+            }),
+        _ => None,
+    });
+    let Some((image, detail)) = latest else {
+        return;
+    };
+    let Some(mut content) = to_annotated_content(summary) else {
+        return;
+    };
+    content.push(AnnotatedContent::new(
+        ContentItem::InputText {
+            text: SUMMARY_PRESERVED_IMAGE_NOTE.to_string(),
+        },
+        ContentItemKind("compaction.summary".to_string()),
+    ));
+    content.push(AnnotatedContent::new(
+        ContentItem::InputImage { image, detail },
+        ContentItemKind("user.image".to_string()),
+    ));
+    let _ = set_annotated_content(summary, content);
 }
 
 pub(crate) fn build_compacted_history(

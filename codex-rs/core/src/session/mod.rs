@@ -1558,6 +1558,10 @@ impl Session {
         format!("auto-compact-{id}")
     }
 
+    pub(crate) async fn history_image_count(&self) -> usize {
+        self.state.lock().await.history_image_count()
+    }
+
     pub(crate) async fn get_total_token_usage(&self) -> i64 {
         let state = self.state.lock().await;
         state.get_total_token_usage(state.server_reasoning_included())

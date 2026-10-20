@@ -936,6 +936,30 @@ impl ContextManager {
 
     /// When true, the server already accounted for past reasoning tokens and
     /// the client should not re-estimate them.
+    /// Counts the images the next request carries, in messages and tool outputs.
+    pub(crate) fn image_count(&self) -> usize {
+        self.raw_items()
+            .map(|item| match item {
+                ResponseItem::Message { content, .. } => content
+                    .iter()
+                    .filter(|content| matches!(content, ContentItem::InputImage { .. }))
+                    .count(),
+                ResponseItem::FunctionCallOutput { output, .. }
+                | ResponseItem::CustomToolCallOutput { output, .. } => {
+                    output.content_items().map_or(0, |items| {
+                        items
+                            .iter()
+                            .filter(|item| {
+                                matches!(item, FunctionCallOutputContentItem::InputImage { .. })
+                            })
+                            .count()
+                    })
+                }
+                _ => 0,
+            })
+            .sum()
+    }
+
     pub(crate) fn get_total_token_usage(&self, server_reasoning_included: bool) -> i64 {
         let last_tokens = self
             .token_info
