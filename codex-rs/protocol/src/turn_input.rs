@@ -14,6 +14,7 @@ use serde::Serialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::fmt;
 use ts_rs::TS;
 
 /// Result of stopping an unfinished root turn so another worker can recover it.
@@ -43,7 +44,7 @@ pub enum TurnInput {
 ///
 /// Callers choose start-or-steer, idle-start, or steer-only behavior through
 /// the corresponding `CodexThread` method.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct TurnInputRequest {
     pub input: TurnInput,
     pub thread_settings: ThreadSettingsOverrides,
@@ -51,6 +52,29 @@ pub struct TurnInputRequest {
     pub additional_context: BTreeMap<String, AdditionalContextEntry>,
     pub responsesapi_client_metadata: Option<HashMap<String, String>>,
     pub trace: Option<W3cTraceContext>,
+}
+
+impl fmt::Debug for TurnInputRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TurnInputRequest")
+            .field("input", &self.input)
+            .field("thread_settings", &self.thread_settings)
+            .field("start", &self.start)
+            .field("additional_context", &self.additional_context)
+            // App-server clients can use this extension to carry short-lived
+            // authorization material to the Responses API. The request still
+            // receives the original values, but Debug output feeds local logs
+            // and must never persist bearer credentials.
+            .field(
+                "responsesapi_client_metadata",
+                &self
+                    .responsesapi_client_metadata
+                    .as_ref()
+                    .map(|_| "<redacted>"),
+            )
+            .field("trace", &self.trace)
+            .finish()
+    }
 }
 
 /// Attribution retained across recovery, sleep, and model-context compaction.
@@ -149,6 +173,24 @@ impl TurnInputRequest {
     pub fn with_trace(mut self, trace: Option<W3cTraceContext>) -> Self {
         self.trace = trace;
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_redacts_responses_api_client_metadata_values() {
+        let secret = "test-gateway-token";
+        let request = TurnInputRequest::user_input(Vec::new()).with_responses_metadata(Some(
+            HashMap::from([("dramaclaw_gateway_api_key".to_string(), secret.to_string())]),
+        ));
+
+        let rendered = format!("{request:?}");
+
+        assert!(!rendered.contains(secret));
+        assert!(rendered.contains("responsesapi_client_metadata: Some(\"<redacted>\")"));
     }
 }
 

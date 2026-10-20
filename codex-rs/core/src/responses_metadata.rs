@@ -44,6 +44,10 @@ pub(crate) const TURN_STARTED_AT_UNIX_MS_KEY: &str = "turn_started_at_unix_ms";
 pub(crate) const HISTORY_INGEST_REQUESTED_KEY: &str = "history_ingest_requested";
 pub(crate) const ANALYTICS_ENABLED_KEY: &str = "analytics_enabled";
 pub(crate) const MCP_ATTRIBUTION_CLIENT_METADATA_KEY: &str = "mcp_attribution";
+pub(crate) const DRAMACLAW_GATEWAY_API_KEY: &str = "dramaclaw_gateway_api_key";
+pub(crate) const DRAMACLAW_CONTROL_CONTEXT_CAPABILITY: &str =
+    "dramaclaw_control_context_capability";
+pub(crate) const X_DRAMACLAW_CONTROL_CAPABILITY_HEADER: &str = "x-dramaclaw-control-capability";
 pub(crate) const MAX_MCP_ATTRIBUTION_BYTES: usize = 16 * 1024;
 
 pub(crate) const FORKED_FROM_THREAD_ID_KEY: &str = "forked_from_thread_id";
@@ -265,6 +269,8 @@ pub struct CodexResponsesMetadata {
     /// Cumulative MCP attribution for this logical request; body-only and model-invisible.
     pub(crate) mcp_attribution: Option<McpAttribution>,
     pub(crate) extra: BTreeMap<String, String>,
+    pub(crate) per_turn_bearer_token: Option<String>,
+    pub(crate) per_turn_control_capability: Option<String>,
 }
 
 impl CodexResponsesMetadata {
@@ -307,7 +313,13 @@ impl CodexResponsesMetadata {
             analytics_enabled: None,
             mcp_attribution: None,
             extra: BTreeMap::new(),
+            per_turn_bearer_token: None,
+            per_turn_control_capability: None,
         }
+    }
+
+    pub(crate) fn per_turn_bearer_token(&self) -> Option<&str> {
+        self.per_turn_bearer_token.as_deref()
     }
 
     pub(crate) fn has_turn_metadata(&self) -> bool {
@@ -400,6 +412,13 @@ impl CodexResponsesMetadata {
         }
         if let Some(subagent_header) = &self.subagent_header {
             insert_header(&mut headers, X_OPENAI_SUBAGENT_HEADER, subagent_header);
+        }
+        if let Some(capability) = &self.per_turn_control_capability {
+            insert_header(
+                &mut headers,
+                X_DRAMACLAW_CONTROL_CAPABILITY_HEADER,
+                capability,
+            );
         }
         headers
     }

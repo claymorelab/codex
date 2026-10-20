@@ -4845,6 +4845,171 @@ async fn snapshot_request_shape_mid_turn_continuation_compaction() {
     );
 }
 
+/// Runs one turn whose tool output pushes it over the limit, so the turn makes
+/// a sampling request, a mid-turn compaction request and a continuation
+/// request. Returns those three requests in order.
+async fn run_mid_turn_compaction_turn(
+    server: &MockServer,
+    model_provider: ModelProviderInfo,
+    responses_metadata: Option<std::collections::HashMap<String, String>>,
+) -> Vec<responses::ResponsesRequest> {
+    let context_window = 100;
+    let limit = context_window * 90 / 100;
+    let over_limit_tokens = context_window * 95 / 100 + 1;
+    let first_turn_mock = mount_sse_once(
+        server,
+        sse(vec![
+            ev_function_call(DUMMY_CALL_ID, DUMMY_FUNCTION_NAME, "{}"),
+            ev_completed_with_tokens("r1", over_limit_tokens),
+        ]),
+    )
+    .await;
+    let auto_compact_mock = mount_sse_once(
+        server,
+        sse(vec![
+            ev_assistant_message("m2", &auto_summary(AUTO_SUMMARY_TEXT)),
+            ev_completed_with_tokens("r2", /*total_tokens*/ 10),
+        ]),
+    )
+    .await;
+    let post_auto_compact_mock = mount_sse_once(
+        server,
+        sse(vec![
+            ev_assistant_message("m3", FINAL_REPLY),
+            ev_completed_with_tokens("r3", /*total_tokens*/ 10),
+        ]),
+    )
+    .await;
+    let mut builder = test_codex().with_config(move |config| {
+        config.model_provider = model_provider;
+        set_test_compact_prompt(config);
+        config.model_context_window = Some(context_window);
+        config.model_auto_compact_token_limit = Some(limit);
+    });
+    let codex = builder.build_with_auto_env(server).await.unwrap().codex;
+
+    codex
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
+                text: FUNCTION_CALL_LIMIT_MSG.into(),
+                text_elements: Vec::new(),
+            }])
+            .with_responses_metadata(responses_metadata),
+        )
+        .await
+        .unwrap();
+    wait_for_event(&codex, |msg| matches!(msg, EventMsg::TurnComplete(_))).await;
+
+    let requests = vec![
+        first_turn_mock.single_request(),
+        auto_compact_mock.single_request(),
+        post_auto_compact_mock.single_request(),
+    ];
+    assert!(
+        body_contains_text(&requests[1].body_json().to_string(), SUMMARIZATION_PROMPT),
+        "the second request should be the mid-turn compaction"
+    );
+    requests
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dramaclaw_turn_key_authorizes_turn_and_compaction_requests() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+    let requests = run_mid_turn_compaction_turn(
+        &server,
+        non_openai_model_provider(&server),
+        Some(std::collections::HashMap::from([
+            (
+                "dramaclaw_gateway_api_key".to_string(),
+                "turn-secret".to_string(),
+            ),
+            (
+                "dramaclaw_control_context_capability".to_string(),
+                "t1.capability".to_string(),
+            ),
+            ("origin".to_string(), "dramaclaw".to_string()),
+        ])),
+    )
+    .await;
+
+    for request in &requests {
+        assert_eq!(
+            request.header("authorization").as_deref(),
+            Some("Bearer turn-secret")
+        );
+        assert_eq!(
+            request.header("x-dramaclaw-control-capability").as_deref(),
+            Some("t1.capability")
+        );
+        let turn_metadata_header = request
+            .header("x-codex-turn-metadata")
+            .expect("turn metadata header");
+        let body = request.body_json().to_string();
+        for observable in [&turn_metadata_header, &body] {
+            assert!(!observable.contains("turn-secret"));
+            assert!(!observable.contains("dramaclaw_gateway_api_key"));
+            assert!(!observable.contains("t1.capability"));
+            assert!(!observable.contains("dramaclaw_control_context_capability"));
+        }
+        assert!(turn_metadata_header.contains("dramaclaw"));
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn turn_without_dramaclaw_key_keeps_refreshing_provider_command_auth() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+    let auth_dir = TempDir::new().unwrap();
+    let tokens: Vec<String> = (1..=20).map(|n| format!("command-token-{n:02}")).collect();
+    fs::write(auth_dir.path().join("tokens.txt"), tokens.join("\n") + "\n").unwrap();
+    codex_utils_cargo_bin::write_executable(
+        &auth_dir.path().join("print-token.sh"),
+        "#!/bin/sh\nsed -n '1p' tokens.txt\ntail -n +2 tokens.txt > tokens.next\nmv tokens.next tokens.txt\n",
+    )
+    .unwrap();
+    let mut model_provider = non_openai_model_provider(&server);
+    model_provider.requires_openai_auth = false;
+    model_provider.env_key = None;
+    model_provider.auth = Some(codex_protocol::config_types::ModelProviderAuthInfo {
+        command: "./print-token.sh".to_string(),
+        args: Vec::new(),
+        timeout_ms: std::num::NonZeroU64::new(5_000).unwrap(),
+        // Piko's provider configuration: refresh before every request.
+        refresh_interval_ms: 1,
+        cwd: AbsolutePathBuf::try_from(auth_dir.path()).unwrap(),
+    });
+
+    let requests = run_mid_turn_compaction_turn(
+        &server,
+        model_provider,
+        Some(std::collections::HashMap::from([(
+            "origin".to_string(),
+            "piko".to_string(),
+        )])),
+    )
+    .await;
+
+    let used: Vec<String> = requests
+        .iter()
+        .map(|request| {
+            let authorization = request.header("authorization").expect("authorization");
+            let token = authorization
+                .strip_prefix("Bearer ")
+                .expect("bearer authorization")
+                .to_string();
+            assert!(tokens.contains(&token), "unexpected token {token}");
+            assert_eq!(request.header("x-dramaclaw-control-capability"), None);
+            token
+        })
+        .collect();
+    // Every request re-runs the provider command; nothing is cached for the turn.
+    assert!(used[0] < used[1] && used[1] < used[2], "tokens {used:?}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn auto_compact_clamps_config_limit_to_context_window() {
     skip_if_no_network!();

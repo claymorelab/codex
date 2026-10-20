@@ -6,6 +6,8 @@ use crate::responses_metadata::CONTEXT_WINDOW_ID_KEY;
 use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::responses_metadata::CompactionTurnMetadata;
+use crate::responses_metadata::DRAMACLAW_CONTROL_CONTEXT_CAPABILITY;
+use crate::responses_metadata::DRAMACLAW_GATEWAY_API_KEY;
 use crate::responses_metadata::FORKED_FROM_ORDINAL_EXCLUSIVE_KEY;
 use crate::responses_metadata::INSTALLATION_ID_KEY;
 use crate::responses_metadata::LEGACY_CODE_MODE_TOOL_NAMES_KEY;
@@ -661,6 +663,70 @@ fn turn_metadata_state_marks_user_input_requested_during_turn_only_for_mcp_reque
             .and_then(Value::as_bool),
         Some(true)
     );
+}
+
+#[test]
+fn turn_metadata_extracts_dramaclaw_gateway_key_without_serializing_it() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let cwd = temp_dir.path().abs();
+    let permission_profile = PermissionProfile::read_only();
+    let state = TurnMetadataState::new(
+        "session-a".to_string(),
+        "thread-a".to_string(),
+        /*forked_from_thread_id*/ None,
+        /*parent_thread_id*/ None,
+        &SessionSource::Exec,
+        /*thread_source*/ None,
+        "turn-a".to_string(),
+        cwd,
+        &permission_profile,
+        WindowsSandboxLevel::Disabled,
+        /*enforce_managed_network*/ false,
+        /*auto_review_enabled*/ false,
+        &model_info_from_slug("gpt-5.4"),
+    );
+    state.set_responsesapi_client_metadata(HashMap::from([
+        (
+            DRAMACLAW_GATEWAY_API_KEY.to_string(),
+            "turn-secret".to_string(),
+        ),
+        (
+            DRAMACLAW_CONTROL_CONTEXT_CAPABILITY.to_string(),
+            "t1.capability".to_string(),
+        ),
+        ("origin".to_string(), "dramaclaw".to_string()),
+    ]));
+
+    let metadata = test_turn_responses_metadata(&state, "window-a");
+    let serialized = metadata.turn_metadata_json().expect("turn metadata json");
+    let client_metadata =
+        serde_json::to_string(&metadata.client_metadata(true)).expect("client metadata json");
+    let mcp_metadata = state
+        .current_meta_value_for_mcp_request(test_mcp_turn_metadata_context())
+        .expect("mcp metadata")
+        .to_string();
+    let headers = metadata.compatibility_headers();
+
+    assert_eq!(metadata.per_turn_bearer_token(), Some("turn-secret"));
+    for rendered in [&serialized, &client_metadata, &mcp_metadata] {
+        assert!(!rendered.contains(DRAMACLAW_GATEWAY_API_KEY));
+        assert!(!rendered.contains("turn-secret"));
+        assert!(!rendered.contains(DRAMACLAW_CONTROL_CONTEXT_CAPABILITY));
+        assert!(!rendered.contains("t1.capability"));
+    }
+    assert!(
+        headers
+            .get("x-codex-turn-metadata")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| !value.contains("turn-secret"))
+    );
+    assert_eq!(
+        headers
+            .get("x-dramaclaw-control-capability")
+            .and_then(|value| value.to_str().ok()),
+        Some("t1.capability")
+    );
+    assert!(serialized.contains("dramaclaw"));
 }
 
 #[test]

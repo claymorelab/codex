@@ -8,6 +8,7 @@ use super::X_CODEX_PARENT_THREAD_ID_HEADER;
 use super::X_CODEX_TURN_METADATA_HEADER;
 use super::X_CODEX_WINDOW_ID_HEADER;
 use super::X_OPENAI_SUBAGENT_HEADER;
+use super::turn_scoped_responses_auth;
 use crate::AttestationContext;
 use crate::AttestationProvider;
 use crate::GenerateAttestationFuture;
@@ -1880,6 +1881,52 @@ fn auth_request_telemetry_context_tracks_attached_auth_and_retry_phase() {
     assert!(auth_context.retry_after_unauthorized);
     assert_eq!(auth_context.recovery_mode, Some("managed"));
     assert_eq!(auth_context.recovery_phase, Some("refresh_token"));
+}
+
+#[test]
+fn turn_scoped_responses_auth_replaces_the_provider_placeholder() {
+    let default_auth = Arc::new(BearerAuthProvider::new("placeholder".to_string()))
+        as codex_api::SharedAuthProvider;
+    let metadata = CodexResponsesMetadata {
+        per_turn_bearer_token: Some("turn-secret".to_string()),
+        ..CodexResponsesMetadata::new(
+            "installation-a".to_string(),
+            "session-a".to_string(),
+            "thread-a".to_string(),
+            "window-a".to_string(),
+        )
+    };
+
+    let auth = turn_scoped_responses_auth(default_auth, &metadata);
+    let headers = auth.to_auth_headers();
+
+    assert_eq!(
+        headers
+            .get(http::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok()),
+        Some("Bearer turn-secret")
+    );
+}
+
+#[test]
+fn turn_scoped_responses_auth_keeps_the_provider_auth_without_a_turn_key() {
+    let default_auth = Arc::new(BearerAuthProvider::new("provider-token".to_string()))
+        as codex_api::SharedAuthProvider;
+    let metadata = CodexResponsesMetadata {
+        per_turn_control_capability: Some("t1.capability".to_string()),
+        ..CodexResponsesMetadata::new(
+            "installation-a".to_string(),
+            "session-a".to_string(),
+            "thread-a".to_string(),
+            "window-a".to_string(),
+        )
+    };
+
+    let auth = turn_scoped_responses_auth(Arc::clone(&default_auth), &metadata);
+
+    // The provider's freshly resolved auth passes through untouched, so
+    // command-backed refresh is never cached or bypassed.
+    assert!(Arc::ptr_eq(&auth, &default_auth));
 }
 
 #[test]
