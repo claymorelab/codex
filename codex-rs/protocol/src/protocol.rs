@@ -2343,16 +2343,17 @@ impl TokenUsageInfo {
     }
 
     pub fn fill_to_context_window(&mut self, context_window: i64) {
-        let previous_total = self.total_token_usage.total_tokens;
-        let delta = (context_window - previous_total).max(0);
-
         self.model_context_window = Some(context_window);
         self.total_token_usage = TokenUsage {
             total_tokens: context_window,
             ..TokenUsage::default()
         };
+        // The active context is read from the last usage, so a full window must
+        // show there. The cumulative total is not the active context: the window
+        // minus it is near zero once a thread has made a few requests, which hid
+        // the overflow from auto-compaction (openai/codex#16033).
         self.last_token_usage = TokenUsage {
-            total_tokens: delta,
+            total_tokens: context_window,
             ..TokenUsage::default()
         };
     }
@@ -6438,5 +6439,26 @@ mod tests {
                 .expect("new_or_append should return info");
 
         assert_eq!(info.model_context_window, Some(258_400));
+    }
+
+    #[test]
+    fn token_usage_info_fill_to_context_window_reports_a_full_active_context() {
+        let mut info = TokenUsageInfo {
+            total_token_usage: TokenUsage {
+                total_tokens: 300_000,
+                ..TokenUsage::default()
+            },
+            last_token_usage: TokenUsage {
+                total_tokens: 36_000,
+                ..TokenUsage::default()
+            },
+            model_context_window: Some(272_000),
+        };
+
+        info.fill_to_context_window(272_000);
+
+        assert_eq!(info.last_token_usage.total_tokens, 272_000);
+        assert_eq!(info.total_token_usage.total_tokens, 272_000);
+        assert_eq!(info.model_context_window, Some(272_000));
     }
 }

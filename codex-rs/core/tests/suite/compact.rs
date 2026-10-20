@@ -5462,6 +5462,83 @@ async fn snapshot_request_shape_pre_turn_compaction_strips_incoming_model_switch
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn context_window_error_compacts_next_turn_after_cumulative_usage_exceeds_window() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+
+    // Three turns use 400 tokens each: 1,200 cumulative against a 1,000-token
+    // window, while each request alone stays below the auto-compaction limit.
+    let mut responses: Vec<String> = (1..=3)
+        .map(|turn| {
+            sse(vec![
+                ev_assistant_message(&format!("m{turn}"), FIRST_REPLY),
+                ev_completed_with_tokens(&format!("r{turn}"), /*total_tokens*/ 400),
+            ])
+        })
+        .collect();
+    responses.push(sse_failed(
+        "overflow",
+        "context_length_exceeded",
+        CONTEXT_LIMIT_MESSAGE,
+    ));
+    responses.push(sse(vec![
+        ev_assistant_message("m-compact", SUMMARY_TEXT),
+        ev_completed_with_tokens("r-compact", /*total_tokens*/ 50),
+    ]));
+    responses.push(sse(vec![
+        ev_assistant_message("m-final", FINAL_REPLY),
+        ev_completed_with_tokens("r-final", /*total_tokens*/ 100),
+    ]));
+    let request_log = mount_sse_sequence(&server, responses).await;
+
+    let mut model_provider = non_openai_model_provider(&server);
+    model_provider.stream_max_retries = Some(0);
+    let codex = test_codex()
+        .with_config(move |config| {
+            config.model_provider = model_provider;
+            set_test_compact_prompt(config);
+            config.model_context_window = Some(1_000);
+            config.model_auto_compact_token_limit = Some(900);
+        })
+        .build(&server)
+        .await
+        .expect("build codex")
+        .codex;
+
+    for text in [
+        "USER_ONE",
+        "USER_TWO",
+        "USER_THREE",
+        "USER_FOUR",
+        "USER_FIVE",
+    ] {
+        codex
+            .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+                text: text.to_string(),
+                text_elements: Vec::new(),
+            }]))
+            .await
+            .expect("submit user turn");
+        wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    }
+
+    let requests = request_log.requests();
+    assert_eq!(
+        requests.len(),
+        6,
+        "expected 4 turns, 1 compaction and the retried turn"
+    );
+    let compact_body = requests[4].body_json().to_string();
+    assert!(
+        body_contains_text(&compact_body, SUMMARIZATION_PROMPT),
+        "the turn after a context window error must compact first, got {compact_body}"
+    );
+    let final_body = requests[5].body_json().to_string();
+    assert!(body_contains_text(&final_body, "USER_FIVE"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn snapshot_request_shape_pre_turn_compaction_context_window_exceeded() {
     skip_if_no_network!();
 
