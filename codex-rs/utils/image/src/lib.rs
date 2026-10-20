@@ -83,6 +83,7 @@ impl PromptImageMode {
     });
 }
 
+#[derive(Clone)]
 struct ImageMetadata {
     icc_profile: Option<Vec<u8>>,
     exif: Option<Vec<u8>>,
@@ -178,6 +179,7 @@ fn load_for_prompt_bytes_uncached(
             PromptImageMode::ResizeToFit | PromptImageMode::Original => None,
         };
 
+        let cap_metadata = metadata.clone();
         let encoded = if let Some((prepared_width, prepared_height, resized)) = target_dimensions {
             let target_format = format
                 .filter(|format| can_preserve_source_bytes(*format))
@@ -217,8 +219,61 @@ fn load_for_prompt_bytes_uncached(
             }
         };
 
-        Ok(encoded)
+        cap_like_original(encoded, &dynamic, format, mode, cap_metadata)
     })()
+}
+
+/// The original Grok Bot sends no image above 1 MB, nor above 1024 px on its long side
+/// (1280 for WebP): its image-resizing middleware shrinks by 0.8 until both hold. Codex
+/// keeps high-detail images up to 2048 px and any size, so screenshot-heavy threads grow
+/// by megabytes per image. Apply the original's caps to every image except one sent at an
+/// explicitly requested original detail.
+const ORIGINAL_MAX_IMAGE_DIMENSION: u32 = 1024;
+const ORIGINAL_MAX_WEBP_IMAGE_DIMENSION: u32 = 1280;
+const ORIGINAL_MAX_IMAGE_BYTES: usize = 1024 * 1024;
+
+fn cap_like_original(
+    encoded: EncodedImage,
+    source: &DynamicImage,
+    format: Option<ImageFormat>,
+    mode: PromptImageMode,
+    metadata: ImageMetadata,
+) -> Result<EncodedImage, ImageProcessingError> {
+    if !matches!(mode, PromptImageMode::ResizeToFit) && mode != PromptImageMode::HIGH_DETAIL {
+        return Ok(encoded);
+    }
+    let max_dimension = if format == Some(ImageFormat::WebP) {
+        ORIGINAL_MAX_WEBP_IMAGE_DIMENSION
+    } else {
+        ORIGINAL_MAX_IMAGE_DIMENSION
+    };
+    if encoded.width.max(encoded.height) <= max_dimension
+        && encoded.bytes.len() <= ORIGINAL_MAX_IMAGE_BYTES
+    {
+        return Ok(encoded);
+    }
+    let scale = (f64::from(max_dimension) / f64::from(encoded.width.max(encoded.height))).min(1.0);
+    let mut width = ((f64::from(encoded.width) * scale).round() as u32).max(1);
+    let mut height = ((f64::from(encoded.height) * scale).round() as u32).max(1);
+    let target_format = format
+        .filter(|format| can_preserve_source_bytes(*format))
+        .unwrap_or(ImageFormat::Png);
+    loop {
+        let resized = source.resize_exact(width, height, FilterType::Triangle);
+        let (bytes, output_format) = encode_image(&resized, target_format, metadata.clone())?;
+        if bytes.len() <= ORIGINAL_MAX_IMAGE_BYTES || width <= 1 || height <= 1 {
+            return Ok(EncodedImage {
+                bytes: bytes.into(),
+                mime: format_to_mime(output_format),
+                source_width: encoded.source_width,
+                source_height: encoded.source_height,
+                width,
+                height,
+            });
+        }
+        width = ((f64::from(width) * 0.8).round() as u32).max(1);
+        height = ((f64::from(height) * 0.8).round() as u32).max(1);
+    }
 }
 
 fn cache_image(cache: &ImageCache, key: ImageCacheKey, image: EncodedImage, byte_capacity: usize) {

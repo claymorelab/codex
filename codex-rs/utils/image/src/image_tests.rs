@@ -145,8 +145,9 @@ async fn downscales_tall_image_to_fit_square_bounds() {
     )
     .expect("process image");
 
-    assert_eq!(processed.width, 512);
-    assert_eq!(processed.height, MAX_DIMENSION);
+    // The original Grok Bot's 1024 px cap applies after Codex's own resize.
+    assert_eq!(processed.width, 256);
+    assert_eq!(processed.height, 1024);
     assert_eq!(processed.mime, "image/png");
 }
 
@@ -163,7 +164,13 @@ async fn resizing_preserves_supported_metadata() {
         )
         .expect("process image");
 
-        assert_eq!((processed.width, processed.height), (2048, 2));
+        // The original Grok Bot caps the long side at 1024 px, or 1280 px for WebP.
+        let expected = if format == ImageFormat::WebP {
+            (1280, 1)
+        } else {
+            (1024, 1)
+        };
+        assert_eq!((processed.width, processed.height), expected);
 
         let mut decoder = ImageReader::with_format(Cursor::new(&processed.bytes), format)
             .into_decoder()
@@ -176,7 +183,7 @@ async fn resizing_preserves_supported_metadata() {
                 decoder.exif_metadata().expect("read EXIF metadata"),
             ),
             (
-                (2048, 2),
+                expected,
                 Orientation::Rotate90,
                 Some(TEST_RGB_ICC_PROFILE.to_vec()),
                 Some(ROTATE_90_EXIF.to_vec()),
@@ -280,7 +287,7 @@ fn data_url_processing_rejects_malformed_input() {
 #[tokio::test(flavor = "multi_thread")]
 async fn detail_modes_apply_expected_budgets() {
     for (mode, input_dimensions, expected_dimensions) in [
-        (PromptImageMode::HIGH_DETAIL, (2048, 2048), (1600, 1600)),
+        (PromptImageMode::HIGH_DETAIL, (2048, 2048), (1024, 1024)),
         (PromptImageMode::ORIGINAL_DETAIL, (6401, 100), (6000, 94)),
     ] {
         let image = ImageBuffer::from_pixel(
@@ -377,4 +384,30 @@ async fn bounds_cache_by_encoded_byte_size() {
     assert!(cache.get(&key(1)).is_none());
     assert!(cache.get(&key(2)).is_some());
     assert!(cache.get(&key(3)).is_none());
+}
+
+/// Like the original Grok Bot, an image above 1 MB shrinks by 0.8 until it fits.
+#[tokio::test(flavor = "multi_thread")]
+async fn high_detail_images_stay_within_one_megabyte() {
+    let mut state = 0x2545_f491_u32;
+    let image = ImageBuffer::from_fn(1000, 1000, |_, _| {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        let [r, g, b, _] = state.to_le_bytes();
+        Rgba([r, g, b, 255])
+    });
+    let original_bytes = image_bytes(&image, ImageFormat::Png);
+    assert!(original_bytes.len() > 1024 * 1024);
+
+    let processed = load_for_prompt_bytes(
+        Path::new("in-memory-image"),
+        original_bytes,
+        PromptImageMode::HIGH_DETAIL,
+    )
+    .expect("process image");
+
+    assert!(processed.bytes.len() <= 1024 * 1024);
+    assert!(processed.width < 1000 && processed.width == processed.height);
+    assert_eq!(processed.mime, "image/png");
 }

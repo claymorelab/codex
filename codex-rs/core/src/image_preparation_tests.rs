@@ -161,7 +161,7 @@ async fn detail_policies_apply_the_expected_budgets() {
             Some(ImageDetail::High),
             ImageDetailSetting::High,
             (2048, 2048),
-            (1600, 1600),
+            (1024, 1024),
         ),
         (
             Some(ImageDetail::Original),
@@ -179,9 +179,9 @@ async fn detail_policies_apply_the_expected_budgets() {
             Some(ImageDetail::Auto),
             ImageDetailSetting::High,
             (2048, 2048),
-            (1600, 1600),
+            (1024, 1024),
         ),
-        (None, ImageDetailSetting::High, (2048, 2048), (1600, 1600)),
+        (None, ImageDetailSetting::High, (2048, 2048), (1024, 1024)),
     ] {
         let (image_url, _) = png_data_url(input_dimensions.0, input_dimensions.1);
         let mut items = vec![ResponseItem::Message {
@@ -314,7 +314,7 @@ async fn upload_failure_keeps_resized_image_inline() {
     else {
         panic!("expected inline image");
     };
-    assert_eq!(decoded_image(image_url).1.dimensions(), (1600, 1600));
+    assert_eq!(decoded_image(image_url).1.dimensions(), (1024, 1024));
 }
 
 /// File-backed images retain their sequence positions even though preparation skips them.
@@ -407,7 +407,7 @@ async fn resize_notices_count_file_backed_images_and_skip_failed_images() {
     .await;
     let expected_user_notice = concat!(
         "<image_resize_notice>\n",
-        "Image 4 of 4 in the preceding user message was resized from 2048x2048 to 1600x1600 pixels.\n",
+        "Image 4 of 4 in the preceding user message was resized from 2048x2048 to 1024x1024 pixels.\n",
         "</image_resize_notice>"
     );
 
@@ -467,7 +467,7 @@ async fn resize_notices_count_file_backed_images_and_skip_failed_images() {
     assert_eq!(failed_message_image, IMAGE_PROCESSING_ERROR_PLACEHOLDER);
     assert_eq!(
         decoded_image(resized_message_image_url).1.dimensions(),
-        (1600, 1600)
+        (1024, 1024)
     );
 
     assert_eq!(
@@ -519,7 +519,7 @@ async fn resize_notices_count_file_backed_images_and_skip_failed_images() {
     assert_eq!(failed_tool_image, IMAGE_PROCESSING_ERROR_PLACEHOLDER);
     assert_eq!(
         decoded_image(resized_tool_image_url).1.dimensions(),
-        (1600, 1600)
+        (1024, 1024)
     );
     assert_eq!(
         &items[3],
@@ -531,7 +531,7 @@ async fn resize_notices_count_file_backed_images_and_skip_failed_images() {
             content: vec![ContentItem::InputText {
                 text: concat!(
                     "<image_resize_notice>\n",
-                    "Image 3 of 3 in the preceding tool output was resized from 2048x2048 to 1600x1600 pixels.\n",
+                    "Image 3 of 3 in the preceding tool output was resized from 2048x2048 to 1024x1024 pixels.\n",
                     "</image_resize_notice>"
                 )
                 .to_string(),

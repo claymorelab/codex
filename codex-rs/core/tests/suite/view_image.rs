@@ -355,7 +355,7 @@ async fn user_turn_with_local_image_attaches_image() -> anyhow::Result<()> {
 
     assert_user_turn_local_image_resizes_to(
         (2304, 864),
-        (2048, 768),
+        (1024, 384),
         ImageBudgetPolicy::DetailBased,
         ResizeNoticeExpectation::Disabled,
     )
@@ -368,7 +368,7 @@ async fn user_turn_with_vertical_local_image_resizes_to_square_bounds() -> anyho
 
     assert_user_turn_local_image_resizes_to(
         (1024, 4096),
-        (512, 2048),
+        (256, 1024),
         ImageBudgetPolicy::DetailBased,
         ResizeNoticeExpectation::Disabled,
     )
@@ -381,7 +381,7 @@ async fn user_turn_local_image_applies_patch_budget_and_reports_resize() -> anyh
 
     assert_user_turn_local_image_resizes_to(
         (2048, 2048),
-        (1600, 1600),
+        (1024, 1024),
         ImageBudgetPolicy::DetailBased,
         ResizeNoticeExpectation::Enabled,
     )
@@ -558,7 +558,7 @@ async fn view_image_tool_attaches_local_image() -> anyhow::Result<()> {
         &input[function_output_index + 1],
         concat!(
             "<image_resize_notice>\n",
-            "Image 1 of 1 in the preceding tool output was resized from 2304x864 to 2048x768 pixels.\n",
+            "Image 1 of 1 in the preceding tool output was resized from 2304x864 to 1024x384 pixels.\n",
             "</image_resize_notice>"
         ),
     );
@@ -577,7 +577,7 @@ async fn view_image_tool_attaches_local_image() -> anyhow::Result<()> {
         .expect("image data decodes from base64 for request");
     let resized = load_from_memory(&decoded).expect("load resized image");
     let (resized_width, resized_height) = resized.dimensions();
-    assert_eq!((resized_width, resized_height), (2048, 768));
+    assert_eq!((resized_width, resized_height), (1024, 384));
 
     Ok(())
 }
@@ -1170,7 +1170,7 @@ async fn view_image_tool_treats_null_detail_as_omitted() -> anyhow::Result<()> {
         .expect("image data decodes from base64 for request");
     let resized = load_from_memory(&decoded).expect("load resized image");
     let (width, height) = resized.dimensions();
-    assert_eq!((width, height), (2048, 768));
+    assert_eq!((width, height), (1024, 384));
 
     Ok(())
 }
@@ -1282,7 +1282,7 @@ async fn assert_view_image_tool_resizes_without_original_support(
         .expect("image data decodes from base64 for request");
     let resized = load_from_memory(&decoded).expect("load resized image");
     let (resized_width, resized_height) = resized.dimensions();
-    assert_eq!((resized_width, resized_height), (2048, 768));
+    assert_eq!((resized_width, resized_height), (1024, 384));
 
     Ok(())
 }
@@ -1373,7 +1373,7 @@ async fn view_image_tool_does_not_force_original_resolution_with_capability_only
         .expect("image data decodes from base64 for request");
     let resized = load_from_memory(&decoded).expect("load resized image");
     let (resized_width, resized_height) = resized.dimensions();
-    assert_eq!((resized_width, resized_height), (2048, 768));
+    assert_eq!((resized_width, resized_height), (1024, 384));
 
     Ok(())
 }
