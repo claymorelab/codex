@@ -3093,3 +3093,73 @@ async fn stream_until_complete_with_metadata(
         }
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn responses_websocket_reconnects_when_dramaclaw_turn_key_changes() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let warmup = vec![ev_response_created("warmup"), ev_completed("warmup")];
+    let turn = vec![ev_response_created("turn"), ev_completed("turn")];
+    let server =
+        start_websocket_server(vec![vec![warmup.clone(), turn.clone(), turn.clone()]; 3]).await;
+    let test = test_codex().build_with_websocket_server(&server).await?;
+    for key in ["key-a", "key-a", "key-b"] {
+        test.codex
+            .start_or_steer_turn(
+                TurnInputRequest::user_input(vec![UserInput::Text {
+                    text: format!("turn with {key}"),
+                    text_elements: Vec::new(),
+                }])
+                .with_responses_metadata(Some(std::collections::HashMap::from(
+                    [("dramaclaw_gateway_api_key".to_string(), key.to_string())],
+                ))),
+            )
+            .await?;
+        wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    }
+
+    // Session prewarm has no turn key and uses the provider auth. Turns that
+    // carry the same key share one socket; a different key never reuses it.
+    let handshake_auth: Vec<_> = server
+        .handshakes()
+        .iter()
+        .map(|handshake| handshake.header("authorization"))
+        .collect();
+    assert_eq!(
+        handshake_auth,
+        vec![
+            Some("Bearer dummy".to_string()),
+            Some("Bearer key-a".to_string()),
+            Some("Bearer key-b".to_string()),
+        ]
+    );
+    let turn_texts: Vec<Vec<String>> = server
+        .connections()
+        .iter()
+        .map(|connection| {
+            connection
+                .iter()
+                .map(|request| request.body_json().to_string())
+                .inspect(|body| assert!(!body.contains("dramaclaw_gateway_api_key")))
+                .filter_map(|body| {
+                    ["turn with key-a", "turn with key-b"]
+                        .into_iter()
+                        .filter(|text| body.contains(text))
+                        .last()
+                        .map(str::to_string)
+                })
+                .collect()
+        })
+        .collect();
+    assert_eq!(
+        turn_texts,
+        vec![
+            Vec::<String>::new(),
+            vec!["turn with key-a".to_string(), "turn with key-a".to_string()],
+            vec!["turn with key-b".to_string()],
+        ]
+    );
+    test.codex.shutdown_and_wait().await?;
+    server.shutdown().await;
+    Ok(())
+}

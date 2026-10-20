@@ -14,6 +14,7 @@ use serde::Serialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::fmt;
 use ts_rs::TS;
 
 /// Result of stopping an unfinished root turn so another worker can recover it.
@@ -67,12 +68,27 @@ pub struct TurnInputRequest {
 }
 
 /// An optional replacement followed by a patch to the turn's client metadata.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct ResponsesApiClientMetadataUpdate {
     /// Replaces the existing map, including when empty.
     pub replacement: Option<HashMap<String, String>>,
     /// Adds or overwrites keys without removing other entries.
     pub patch: Option<HashMap<String, String>>,
+}
+
+// App-server clients can use this extension to carry short-lived authorization
+// material to the Responses API. The request still receives the original values,
+// but Debug output feeds local logs and must never persist bearer credentials.
+impl fmt::Debug for ResponsesApiClientMetadataUpdate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ResponsesApiClientMetadataUpdate")
+            .field(
+                "replacement",
+                &self.replacement.as_ref().map(|_| "<redacted>"),
+            )
+            .field("patch", &self.patch.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 /// Attribution retained across recovery, sleep, and model-context compaction.
@@ -180,6 +196,34 @@ impl TurnInputRequest {
     pub fn with_trace(mut self, trace: Option<W3cTraceContext>) -> Self {
         self.trace = trace;
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_redacts_responses_api_client_metadata_values() {
+        let secret = "test-gateway-token";
+        let patched = "test-patched-token";
+        let request = TurnInputRequest::user_input(Vec::new())
+            .with_responses_metadata(Some(HashMap::from([(
+                "dramaclaw_gateway_api_key".to_string(),
+                secret.to_string(),
+            )])))
+            .with_responses_metadata_patch(Some(HashMap::from([(
+                "dramaclaw_gateway_api_key".to_string(),
+                patched.to_string(),
+            )])));
+
+        let rendered = format!("{request:?}");
+
+        assert!(!rendered.contains(secret));
+        assert!(!rendered.contains(patched));
+        assert!(rendered.contains(
+            "ResponsesApiClientMetadataUpdate { replacement: Some(\"<redacted>\"), patch: Some(\"<redacted>\") }"
+        ));
     }
 }
 

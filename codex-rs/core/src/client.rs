@@ -141,6 +141,7 @@ use codex_login::auth::AgentIdentityAuthPolicy;
 use codex_login::auth_env_telemetry::AuthEnvTelemetry;
 use codex_login::auth_env_telemetry::collect_auth_env_telemetry;
 use codex_model_provider::AgentIdentitySessionFallback;
+use codex_model_provider::BearerAuthProvider;
 use codex_model_provider::ProviderAuthScope;
 use codex_model_provider::ProviderUnauthorizedRecovery;
 use codex_model_provider::ResponsesConnectionKey;
@@ -181,6 +182,39 @@ const MEMORIES_SUMMARIZE_ENDPOINT: &str = "/memories/trace_summarize";
 #[cfg(test)]
 pub(crate) const WEBSOCKET_CONNECT_TIMEOUT: Duration =
     Duration::from_millis(DEFAULT_WEBSOCKET_CONNECT_TIMEOUT_MS);
+
+/// Auth for one turn's Responses requests.
+///
+/// An app-server client may pass a per-turn gateway key through
+/// `responsesapi_client_metadata`; it replaces the provider's auth for that
+/// turn only. Without it the provider's freshly resolved auth is returned
+/// unchanged, so command-backed refresh keeps working.
+fn turn_scoped_responses_auth(
+    default_auth: SharedAuthProvider,
+    responses_metadata: &CodexResponsesMetadata,
+) -> SharedAuthProvider {
+    responses_metadata
+        .per_turn_bearer_token()
+        .map_or(default_auth, |token| {
+            Arc::new(BearerAuthProvider::new(token.to_string())) as SharedAuthProvider
+        })
+}
+
+/// Identifies a turn's per-turn gateway key and control capability without
+/// keeping the values themselves in Debug-printable state.
+fn per_turn_authority_fingerprint(responses_metadata: &CodexResponsesMetadata) -> Option<u64> {
+    use std::hash::Hash;
+    use std::hash::Hasher;
+
+    let token = responses_metadata.per_turn_bearer_token.as_deref();
+    let capability = responses_metadata.per_turn_control_capability.as_deref();
+    if token.is_none() && capability.is_none() {
+        return None;
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (token, capability).hash(&mut hasher);
+    Some(hasher.finish())
+}
 
 fn session_telemetry_for_request(
     session_telemetry: &SessionTelemetry,
@@ -335,6 +369,9 @@ struct WebsocketSession {
     /// Owner of the cached state, including before a connection is opened.
     auth_owner_generation: Option<u64>,
     connection_key: Option<ResponsesConnectionKey>,
+    /// Fingerprint of the per-turn gateway key and control capability the
+    /// handshake carried; the values themselves stay out of this Debug type.
+    per_turn_authority: Option<u64>,
     last_request: Option<ResponsesApiRequest>,
     last_response_rx: Option<oneshot::Receiver<LastResponse>>,
     last_response_from_untraced_warmup: bool,
@@ -1619,9 +1656,10 @@ impl ModelClientSession {
                 .client
                 .current_client_setup(ClientRouting::Workspace)
                 .await?;
+            let api_auth = turn_scoped_responses_auth(client_setup.api_auth, responses_metadata);
             let auth_context = AuthRequestTelemetryContext::new(
                 client_setup.auth.as_ref().map(CodexAuth::auth_mode),
-                client_setup.api_auth.as_ref(),
+                api_auth.as_ref(),
                 client_setup.agent_identity_telemetry.clone(),
                 pending_retry,
             )
@@ -1643,7 +1681,7 @@ impl ModelClientSession {
                     session_telemetry,
                     api_provider: client_setup.api_provider,
                     auth_revision: client_setup.auth_revision,
-                    api_auth: client_setup.api_auth,
+                    api_auth,
                     auth_owner_generation: client_setup.auth_owner_generation,
                     responses_metadata: &websocket_metadata,
                     auth_context,
@@ -1709,10 +1747,14 @@ impl ModelClientSession {
             responses_headers,
         } = params;
         let connection_key = ResponsesConnectionKey::new(&api_provider, auth_revision);
+        // Handshake auth and headers are fixed per socket, so a turn with
+        // different per-turn authority must not reuse another turn's socket.
+        let per_turn_authority = per_turn_authority_fingerprint(responses_metadata);
         let reset_reason = match self.websocket_session.connection.as_ref() {
             Some(_)
                 if self.websocket_session.responses_headers != *responses_headers
-                    || self.websocket_session.connection_key.as_ref() != Some(&connection_key) =>
+                    || self.websocket_session.connection_key.as_ref() != Some(&connection_key)
+                    || self.websocket_session.per_turn_authority != per_turn_authority =>
             {
                 Some("other")
             }
@@ -1749,6 +1791,7 @@ impl ModelClientSession {
             self.websocket_session.responses_headers = responses_headers.clone();
             self.websocket_session.auth_owner_generation = auth_owner_generation;
             self.websocket_session.connection_key = Some(connection_key);
+            self.websocket_session.per_turn_authority = per_turn_authority;
             self.websocket_session
                 .set_connection_reused(/*connection_reused*/ false);
         } else {
@@ -1825,6 +1868,7 @@ impl ResponsesHttpExecutor<'_> {
             }) {
                 return Err(CodexErr::TurnAborted);
             }
+            let api_auth = turn_scoped_responses_auth(client_setup.api_auth, responses_metadata);
             let include_internal = self
                 .client
                 .state
@@ -1841,7 +1885,7 @@ impl ResponsesHttpExecutor<'_> {
             )?;
             let request_auth_context = AuthRequestTelemetryContext::new(
                 client_setup.auth.as_ref().map(CodexAuth::auth_mode),
-                client_setup.api_auth.as_ref(),
+                api_auth.as_ref(),
                 client_setup.agent_identity_telemetry.clone(),
                 pending_retry,
             )
@@ -1916,12 +1960,8 @@ impl ResponsesHttpExecutor<'_> {
                 request.input = input;
             }
             inference_trace_attempt.record_started(&request);
-            let client = ApiResponsesClient::new(
-                transport,
-                client_setup.api_provider,
-                client_setup.api_auth,
-            )
-            .with_telemetry(Some(request_telemetry), Some(sse_telemetry));
+            let client = ApiResponsesClient::new(transport, client_setup.api_provider, api_auth)
+                .with_telemetry(Some(request_telemetry), Some(sse_telemetry));
             let stream_result = client.stream_request(request, options).await;
 
             match stream_result {
@@ -2022,6 +2062,7 @@ impl ModelClientSession {
                 .client
                 .current_client_setup(ClientRouting::Workspace)
                 .await?;
+            let api_auth = turn_scoped_responses_auth(client_setup.api_auth, responses_metadata);
             let include_internal = self
                 .client
                 .state
@@ -2033,7 +2074,7 @@ impl ModelClientSession {
             tracing::Span::current().record("api.path", "/responses");
             let request_auth_context = AuthRequestTelemetryContext::new(
                 client_setup.auth.as_ref().map(CodexAuth::auth_mode),
-                client_setup.api_auth.as_ref(),
+                api_auth.as_ref(),
                 client_setup.agent_identity_telemetry.clone(),
                 pending_retry,
             )
@@ -2073,7 +2114,7 @@ impl ModelClientSession {
                     session_telemetry,
                     api_provider: client_setup.api_provider,
                     auth_revision: client_setup.auth_revision,
-                    api_auth: client_setup.api_auth,
+                    api_auth,
                     auth_owner_generation: client_setup.auth_owner_generation,
                     responses_metadata: &websocket_metadata,
                     auth_context: request_auth_context,
