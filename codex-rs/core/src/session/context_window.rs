@@ -4,6 +4,13 @@ use crate::config::Config;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
 use codex_protocol::openai_models::ModelInfo;
 
+/// Images a request may carry before auto-compaction runs, whatever its token count.
+/// An image costs few tokens but many bytes, so a screenshot-heavy context can outgrow
+/// a request size limit long before its token budget. The original Grok Bot compacts
+/// on image count the same way (`IMAGE_SUMMARIZATION_TRIGGER_COUNT`, 85); 24 keeps
+/// 1920x1080 PNG screenshots, about 1 MB each, under a 32 MB request body limit.
+pub(crate) const AUTO_COMPACT_IMAGE_LIMIT: usize = 24;
+
 #[derive(Debug)]
 pub(crate) struct ContextWindowTokenStatus {
     // Full active context usage, independent of the configured auto-compact scope.
@@ -107,7 +114,8 @@ async fn context_window_token_status_with_config(
         full_context_window_limit.is_some_and(|limit| active_context_tokens >= limit);
     let token_limit_reached = buffered_auto_compact_limit
         .is_some_and(|limit| auto_compact_scope_tokens >= limit)
-        || full_context_window_limit_reached;
+        || full_context_window_limit_reached
+        || sess.history_image_count().await >= AUTO_COMPACT_IMAGE_LIMIT;
     let post_turn_percent = config.model_post_turn_compact_threshold_percent;
     let turn_end_compaction_threshold_reached = post_turn_percent > 0
         && (token_limit_reached

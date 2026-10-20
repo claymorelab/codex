@@ -5462,6 +5462,91 @@ async fn snapshot_request_shape_pre_turn_compaction_strips_incoming_model_switch
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn image_count_limit_compacts_before_next_turn() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+    let request_log = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_assistant_message("m1", FIRST_REPLY),
+                ev_completed_with_tokens("r1", /*total_tokens*/ 100),
+            ]),
+            sse(vec![
+                ev_assistant_message("m-compact", SUMMARY_TEXT),
+                ev_completed_with_tokens("r-compact", /*total_tokens*/ 50),
+            ]),
+            sse(vec![
+                ev_assistant_message("m2", FINAL_REPLY),
+                ev_completed_with_tokens("r2", /*total_tokens*/ 100),
+            ]),
+        ],
+    )
+    .await;
+
+    let model_provider = non_openai_model_provider(&server);
+    let codex = test_codex()
+        .with_config(move |config| {
+            config.model_provider = model_provider;
+            set_test_compact_prompt(config);
+        })
+        .build(&server)
+        .await
+        .expect("build codex")
+        .codex;
+
+    // Few tokens, many images: only the image count can trigger compaction.
+    let image_url = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
+    // `AUTO_COMPACT_IMAGE_LIMIT` in core/src/session/context_window.rs.
+    let mut first_input: Vec<UserInput> = (0..24)
+        .map(|_| UserInput::Image {
+            image: ImageReference::Inline {
+                image_url: image_url.to_string(),
+            },
+            detail: None,
+        })
+        .collect();
+    first_input.push(UserInput::Text {
+        text: "USER_ONE".to_string(),
+        text_elements: Vec::new(),
+    });
+    for input in [
+        first_input,
+        vec![UserInput::Text {
+            text: "USER_TWO".to_string(),
+            text_elements: Vec::new(),
+        }],
+    ] {
+        codex
+            .start_or_steer_turn(TurnInputRequest::user_input(input))
+            .await
+            .expect("submit user turn");
+        wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    }
+
+    let requests = request_log.requests();
+    assert_eq!(
+        requests.len(),
+        3,
+        "expected the turn, one compaction and the next turn"
+    );
+    let compact_body = requests[1].body_json().to_string();
+    assert!(
+        body_contains_text(&compact_body, SUMMARIZATION_PROMPT),
+        "reaching the image limit must compact before the next turn, got {compact_body}"
+    );
+    let final_body = requests[2].body_json().to_string();
+    assert!(body_contains_text(&final_body, "USER_TWO"));
+    // Like the original Grok Bot, only the latest image survives, after its note.
+    assert_eq!(final_body.matches("\"input_image\"").count(), 1);
+    assert!(body_contains_text(
+        &final_body,
+        "[Latest screenshot]: The image below is the most recent screenshot"
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn context_window_error_compacts_next_turn_after_cumulative_usage_exceeds_window() {
     skip_if_no_network!();
 
