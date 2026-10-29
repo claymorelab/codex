@@ -89,20 +89,38 @@ impl<T: HttpTransport> ImagesClient<T> {
         extra_headers: HeaderMap,
         operation: &str,
     ) -> Result<(ImageResponse, Option<String>), ImageRequestError> {
-        let body = to_value(request).map_err(|e| ImageRequestError {
+        let mut body = to_value(request).map_err(|e| ImageRequestError {
             error: ApiError::Stream(format!("failed to encode {operation} request: {e}")),
             imagegen_request_id: None,
         })?;
+        // Piko configures this provider name. Its gateway archives images and defaults
+        // to URL delivery unless base64 is explicitly requested; this client only
+        // consumes b64_json. Leave other providers' request contracts unchanged.
+        if self.session.provider().name == "Claymore Model Gateway" {
+            body["response_format"] = serde_json::json!("b64_json");
+        }
         let resp = self
             .session
             .execute(Method::POST, path, extra_headers, Some(body))
             .await
             .map_err(ImageRequestError::from_api_error)?;
         let imagegen_request_id = imagegen_request_id_from_headers(&resp.headers);
-        let response = serde_json::from_slice(&resp.body).map_err(|e| ImageRequestError {
-            error: ApiError::Stream(format!("failed to decode {operation} response: {e}")),
-            imagegen_request_id: imagegen_request_id.clone(),
-        })?;
+        let response: ImageResponse =
+            serde_json::from_slice(&resp.body).map_err(|e| ImageRequestError {
+                error: ApiError::Stream(format!("failed to decode {operation} response: {e}")),
+                imagegen_request_id: imagegen_request_id.clone(),
+            })?;
+        if response.data.is_empty()
+            || response
+                .data
+                .iter()
+                .any(|image| image.b64_json.trim().is_empty())
+        {
+            return Err(ImageRequestError {
+                error: ApiError::Stream(format!("{operation} returned no base64 image data")),
+                imagegen_request_id,
+            });
+        }
         Ok((response, imagegen_request_id))
     }
 }
@@ -375,6 +393,109 @@ mod tests {
                 "model": "gpt-image-1.5",
             }))
         );
+    }
+
+    #[tokio::test]
+    async fn only_claymore_gateway_requests_base64_for_generation_and_edits() {
+        for name in ["Claymore Model Gateway", "OpenAI", "test"] {
+            for edit in [false, true] {
+                let transport = CapturingTransport::new(response_body());
+                let mut provider = provider();
+                provider.name = name.to_string();
+                let client = ImagesClient::new(transport.clone(), provider, Arc::new(DummyAuth));
+                let result = if edit {
+                    client
+                        .edit(
+                            &ImageEditRequest {
+                                images: vec![ImageReference::File {
+                                    file_id: "file-image".to_string(),
+                                }],
+                                prompt: "edit a cat".to_string(),
+                                background: None,
+                                model: "gpt-image-2".to_string(),
+                                n: None,
+                                quality: None,
+                                size: None,
+                            },
+                            HeaderMap::new(),
+                        )
+                        .await
+                } else {
+                    client
+                        .generate(
+                            &ImageGenerationRequest {
+                                prompt: "draw a cat".to_string(),
+                                background: None,
+                                model: "gpt-image-2".to_string(),
+                                n: None,
+                                quality: None,
+                                size: None,
+                            },
+                            HeaderMap::new(),
+                        )
+                        .await
+                };
+                assert_eq!(
+                    result.expect("image request succeeds").0,
+                    expected_response()
+                );
+                let request = captured_request(&transport);
+                let body = request
+                    .body
+                    .as_ref()
+                    .and_then(RequestBody::json)
+                    .expect("JSON request");
+                assert_eq!(
+                    body.get("response_format")
+                        .and_then(serde_json::Value::as_str),
+                    (name == "Claymore Model Gateway").then_some("b64_json"),
+                    "provider {name}, edit {edit}",
+                );
+                assert!(
+                    !request.url.contains("response_format"),
+                    "format belongs in the JSON body"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_image_results_fail_instead_of_producing_empty_files() {
+        for data in [
+            json!([]),
+            json!([{"b64_json": "", "url": "https://example.com/archived.png"}]),
+            json!([{"b64_json": " \n\t"}]),
+            json!([{"b64_json": "cG5n"}, {"b64_json": ""}]),
+        ] {
+            let body = serde_json::to_vec(&json!({"created": 1, "data": data})).unwrap();
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                X_CODEX_IMAGEGEN_REQUEST_ID_HEADER,
+                http::HeaderValue::from_static("req-empty"),
+            );
+            let transport = CapturingTransport::with_response_headers(body, headers);
+            let client = ImagesClient::new(transport, provider(), Arc::new(DummyAuth));
+            let error = client
+                .generate(
+                    &ImageGenerationRequest {
+                        prompt: "draw a cat".to_string(),
+                        background: None,
+                        model: "gpt-image-2".to_string(),
+                        n: None,
+                        quality: None,
+                        size: None,
+                    },
+                    HeaderMap::new(),
+                )
+                .await
+                .expect_err("empty image data must fail");
+            let (error, request_id) = error.into_parts();
+            assert_eq!(request_id.as_deref(), Some("req-empty"));
+            let ApiError::Stream(message) = error else {
+                panic!("expected an image response error");
+            };
+            assert_eq!(message, "image generation returned no base64 image data");
+        }
     }
 
     #[tokio::test]
