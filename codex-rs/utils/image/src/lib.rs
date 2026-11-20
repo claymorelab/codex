@@ -19,6 +19,9 @@ use image::codecs::jpeg::JpegEncoder;
 use image::codecs::png::PngEncoder;
 use image::codecs::webp::WebPEncoder;
 use image::imageops::FilterType;
+use image::metadata::Orientation;
+use tracing::debug;
+use tracing::warn;
 
 const DATA_URL_PREFIX: &str = "data:";
 pub const PROMPT_IMAGE_PATCH_SIZE: u32 = 32;
@@ -65,6 +68,12 @@ pub enum PromptImageMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PromptImageTreatment {
+    Message,
+    ToolOutput,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PromptImageResizeLimits {
     pub max_dimension: u32,
     pub max_patches: usize,
@@ -93,6 +102,7 @@ struct ImageMetadata {
 struct ImageCacheKey {
     digest: [u8; 20],
     mode: PromptImageMode,
+    treatment: PromptImageTreatment,
 }
 
 type ImageCache = BlockingLruCache<ImageCacheKey, EncodedImage>;
@@ -105,18 +115,28 @@ pub fn load_for_prompt_bytes(
     file_bytes: Vec<u8>,
     mode: PromptImageMode,
 ) -> Result<EncodedImage, ImageProcessingError> {
+    load_for_prompt_bytes_with_treatment(path, file_bytes, mode, PromptImageTreatment::Message)
+}
+
+fn load_for_prompt_bytes_with_treatment(
+    path: &Path,
+    file_bytes: Vec<u8>,
+    mode: PromptImageMode,
+    treatment: PromptImageTreatment,
+) -> Result<EncodedImage, ImageProcessingError> {
     let path_buf = path.to_path_buf();
 
     let key = ImageCacheKey {
         digest: sha1_digest(&file_bytes),
         mode,
+        treatment,
     };
 
     if let Some(image) = IMAGE_CACHE.get(&key) {
         return Ok(image);
     }
 
-    let image = load_for_prompt_bytes_uncached(&path_buf, file_bytes, mode)?;
+    let image = load_for_prompt_bytes_uncached(&path_buf, file_bytes, mode, treatment)?;
     cache_image(&IMAGE_CACHE, key, image.clone(), MAX_IMAGE_CACHE_BYTES);
     Ok(image)
 }
@@ -125,6 +145,7 @@ fn load_for_prompt_bytes_uncached(
     path: &Path,
     file_bytes: Vec<u8>,
     mode: PromptImageMode,
+    treatment: PromptImageTreatment,
 ) -> Result<EncodedImage, ImageProcessingError> {
     let path_buf = path.to_path_buf();
     (move || {
@@ -180,19 +201,19 @@ fn load_for_prompt_bytes_uncached(
         };
 
         let cap_metadata = metadata.clone();
-        let encoded = if let Some((prepared_width, prepared_height, resized)) = target_dimensions {
+        let encoded = if let Some((prepared_width, prepared_height, resized)) = &target_dimensions {
             let target_format = format
                 .filter(|format| can_preserve_source_bytes(*format))
                 .unwrap_or(ImageFormat::Png);
-            let (bytes, output_format) = encode_image(&resized, target_format, metadata)?;
+            let (bytes, output_format) = encode_image(resized, target_format, metadata)?;
             let mime = format_to_mime(output_format);
             EncodedImage {
                 bytes: bytes.into(),
                 mime,
                 source_width: width,
                 source_height: height,
-                width: prepared_width,
-                height: prepared_height,
+                width: *prepared_width,
+                height: *prepared_height,
             }
         } else {
             if let Some(format) = format.filter(|format| can_preserve_source_bytes(*format)) {
@@ -219,15 +240,26 @@ fn load_for_prompt_bytes_uncached(
             }
         };
 
-        cap_like_original(encoded, &dynamic, format, mode, cap_metadata)
+        match treatment {
+            PromptImageTreatment::Message => {
+                cap_like_original(encoded, &dynamic, format, mode, cap_metadata)
+            }
+            PromptImageTreatment::ToolOutput => cap_tool_output_bytes(
+                encoded,
+                target_dimensions
+                    .as_ref()
+                    .map_or(&dynamic, |(_, _, resized)| resized),
+                cap_metadata,
+            ),
+        }
     })()
 }
 
 /// The original Grok Bot sends no image above 1 MB, nor above 1024 px on its long side
 /// (1280 for WebP): its image-resizing middleware shrinks by 0.8 until both hold. Codex
 /// keeps high-detail images up to 2048 px and any size, so screenshot-heavy threads grow
-/// by megabytes per image. Apply the original's caps to every image except one sent at an
-/// explicitly requested original detail.
+/// by megabytes per image. Apply the original's caps to message images in the
+/// high-detail and resize-to-fit modes.
 const ORIGINAL_MAX_IMAGE_DIMENSION: u32 = 1024;
 const ORIGINAL_MAX_WEBP_IMAGE_DIMENSION: u32 = 1280;
 const ORIGINAL_MAX_IMAGE_BYTES: usize = 1024 * 1024;
@@ -276,6 +308,89 @@ fn cap_like_original(
     }
 }
 
+fn cap_tool_output_bytes(
+    mut encoded: EncodedImage,
+    image: &DynamicImage,
+    mut metadata: ImageMetadata,
+) -> Result<EncodedImage, ImageProcessingError> {
+    if encoded.bytes.len() <= ORIGINAL_MAX_IMAGE_BYTES {
+        return Ok(encoded);
+    }
+
+    // JPEG stores EXIF in one APP1 segment. Retain the orientation if the full EXIF won't fit.
+    const JPEG_MAX_EXIF_BYTES: usize = u16::MAX as usize - 2 - 6;
+    if let Some(exif) = &metadata.exif
+        && exif.len() > JPEG_MAX_EXIF_BYTES
+    {
+        metadata.exif = Orientation::from_exif_chunk(exif).map(|orientation| {
+            // Little-endian TIFF with one IFD0 entry (Orientation, SHORT, count 1).
+            let mut tiff = *b"II\x2a\0\x08\0\0\0\
+                             \x01\0\x12\x01\x03\0\x01\0\0\0\0\0\0\0\
+                             \0\0\0\0";
+            tiff[18] = orientation.to_exif();
+            tiff.to_vec()
+        });
+    }
+    // JPEG ICC profiles can span up to 255 APP2 segments.
+    const JPEG_MAX_ICC_BYTES: usize = 255 * (u16::MAX as usize - 2 - 14);
+    metadata.icc_profile = metadata
+        .icc_profile
+        .filter(|profile| profile.len() <= JPEG_MAX_ICC_BYTES);
+
+    let mut rgb = image.to_rgb8();
+    if image.color().has_alpha() {
+        for (pixel, rgba) in rgb.pixels_mut().zip(image.to_rgba8().pixels()) {
+            let alpha = u16::from(rgba[3]);
+            for channel in &mut pixel.0 {
+                *channel = ((u16::from(*channel) * alpha + 255 * (255 - alpha) + 127) / 255) as u8;
+            }
+        }
+    }
+
+    let mut bytes = Vec::new();
+    let mut quality = 85;
+    for step in [85, 70, 50] {
+        quality = step;
+        bytes.clear();
+        let mut encoder = JpegEncoder::new_with_quality(&mut bytes, quality);
+        apply_image_metadata(
+            &mut encoder,
+            metadata.icc_profile.clone(),
+            metadata.exif.clone(),
+            ImageFormat::Jpeg,
+        )?;
+        encoder
+            .encode_image(&rgb)
+            .map_err(|source| ImageProcessingError::Encode {
+                format: ImageFormat::Jpeg,
+                source,
+            })?;
+        if bytes.len() <= ORIGINAL_MAX_IMAGE_BYTES {
+            break;
+        }
+    }
+
+    let (width, height) = (encoded.width, encoded.height);
+    let size_bytes = bytes.len();
+    if size_bytes > ORIGINAL_MAX_IMAGE_BYTES {
+        warn!(
+            width,
+            height,
+            quality,
+            size_bytes,
+            "tool output image still exceeds 1 MiB after JPEG re-encoding"
+        );
+    } else {
+        debug!(
+            width,
+            height, quality, size_bytes, "re-encoded tool output image as JPEG"
+        );
+    }
+    encoded.bytes = bytes.into();
+    encoded.mime = format_to_mime(ImageFormat::Jpeg);
+    Ok(encoded)
+}
+
 fn cache_image(cache: &ImageCache, key: ImageCacheKey, image: EncodedImage, byte_capacity: usize) {
     if image.bytes.len() > byte_capacity {
         return;
@@ -299,21 +414,25 @@ fn cache_image(cache: &ImageCache, key: ImageCacheKey, image: EncodedImage, byte
 pub fn load_data_url_for_prompt(
     image_url: &str,
     mode: PromptImageMode,
+    treatment: PromptImageTreatment,
 ) -> Result<EncodedImage, ImageProcessingError> {
-    load_data_url_for_prompt_with(image_url, mode, load_for_prompt_bytes)
+    load_data_url_for_prompt_with(image_url, |path, bytes| {
+        load_for_prompt_bytes_with_treatment(path, bytes, mode, treatment)
+    })
 }
 
 pub fn load_data_url_for_prompt_uncached(
     image_url: &str,
     mode: PromptImageMode,
 ) -> Result<EncodedImage, ImageProcessingError> {
-    load_data_url_for_prompt_with(image_url, mode, load_for_prompt_bytes_uncached)
+    load_data_url_for_prompt_with(image_url, |path, bytes| {
+        load_for_prompt_bytes_uncached(path, bytes, mode, PromptImageTreatment::Message)
+    })
 }
 
 fn load_data_url_for_prompt_with(
     image_url: &str,
-    mode: PromptImageMode,
-    load: impl FnOnce(&Path, Vec<u8>, PromptImageMode) -> Result<EncodedImage, ImageProcessingError>,
+    load: impl FnOnce(&Path, Vec<u8>) -> Result<EncodedImage, ImageProcessingError>,
 ) -> Result<EncodedImage, ImageProcessingError> {
     let rest = image_url
         .get(..DATA_URL_PREFIX.len())
@@ -357,7 +476,7 @@ fn load_data_url_for_prompt_with(
         });
     }
 
-    load(Path::new("<data-url-image>"), file_bytes, mode)
+    load(Path::new("<data-url-image>"), file_bytes)
 }
 
 fn prompt_image_output_dimensions_for_limits(

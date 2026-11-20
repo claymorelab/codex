@@ -258,8 +258,12 @@ async fn data_url_processing_converts_gif_to_png() {
     let gif_bytes = image_bytes(&image, ImageFormat::Gif);
     let image_url = data_url_from_bytes("image/gif", &gif_bytes);
 
-    let processed = load_data_url_for_prompt(&image_url, PromptImageMode::ResizeToFit)
-        .expect("process GIF data URL");
+    let processed = load_data_url_for_prompt(
+        &image_url,
+        PromptImageMode::ResizeToFit,
+        PromptImageTreatment::Message,
+    )
+    .expect("process GIF data URL");
 
     assert_eq!(processed.mime, "image/png");
     assert_eq!(
@@ -277,7 +281,11 @@ fn data_url_processing_rejects_malformed_input() {
         "data:image/png;base64,not base64",
     ] {
         assert!(matches!(
-            load_data_url_for_prompt(image_url, PromptImageMode::ResizeToFit),
+            load_data_url_for_prompt(
+                image_url,
+                PromptImageMode::ResizeToFit,
+                PromptImageTreatment::Message,
+            ),
             Err(ImageProcessingError::InvalidDataUrl { .. })
         ));
     }
@@ -367,6 +375,7 @@ async fn bounds_cache_by_encoded_byte_size() {
     let key = |digest_byte| ImageCacheKey {
         digest: [digest_byte; 20],
         mode: PromptImageMode::Original,
+        treatment: PromptImageTreatment::Message,
     };
     let image = |size| EncodedImage {
         bytes: vec![0; size].into(),
@@ -386,17 +395,21 @@ async fn bounds_cache_by_encoded_byte_size() {
     assert!(cache.get(&key(3)).is_none());
 }
 
-/// Like the original Grok Bot, an image above 1 MB shrinks by 0.8 until it fits.
-#[tokio::test(flavor = "multi_thread")]
-async fn high_detail_images_stay_within_one_megabyte() {
+fn noise_image(width: u32, height: u32) -> ImageBuffer<Rgba<u8>, Vec<u8>> {
     let mut state = 0x2545_f491_u32;
-    let image = ImageBuffer::from_fn(1000, 1000, |_, _| {
+    ImageBuffer::from_fn(width, height, |_, _| {
         state ^= state << 13;
         state ^= state >> 17;
         state ^= state << 5;
         let [r, g, b, _] = state.to_le_bytes();
         Rgba([r, g, b, 255])
-    });
+    })
+}
+
+/// Like the original Grok Bot, a message image above 1 MiB shrinks by 0.8 until it fits.
+#[tokio::test(flavor = "multi_thread")]
+async fn high_detail_images_stay_within_one_megabyte() {
+    let image = noise_image(1000, 1000);
     let original_bytes = image_bytes(&image, ImageFormat::Png);
     assert!(original_bytes.len() > 1024 * 1024);
 
@@ -410,4 +423,153 @@ async fn high_detail_images_stay_within_one_megabyte() {
     assert!(processed.bytes.len() <= 1024 * 1024);
     assert!(processed.width < 1000 && processed.width == processed.height);
     assert_eq!(processed.mime, "image/png");
+}
+
+#[test]
+fn tool_output_and_message_images_use_separate_cache_entries() {
+    use PromptImageTreatment::Message;
+    use PromptImageTreatment::ToolOutput;
+
+    for (red, order) in [(10, [Message, ToolOutput]), (20, [ToolOutput, Message])] {
+        let image = ImageBuffer::from_pixel(1430, 805, Rgba([red, 20, 30, 255]));
+        let original_bytes = image_bytes(&image, ImageFormat::Png);
+        assert!(original_bytes.len() <= ORIGINAL_MAX_IMAGE_BYTES);
+        let url = data_url_from_bytes("image/png", &original_bytes);
+
+        for treatment in order.into_iter().chain(order) {
+            let processed = load_data_url_for_prompt(&url, PromptImageMode::HIGH_DETAIL, treatment)
+                .expect("process PNG");
+            let decoded = image::load_from_memory(&processed.bytes).expect("decode processed PNG");
+            assert_eq!((processed.width, processed.height), decoded.dimensions());
+            assert_eq!(processed.mime, "image/png");
+            match treatment {
+                Message => assert_eq!(decoded.dimensions(), (1024, 576)),
+                ToolOutput => {
+                    assert_eq!(decoded.dimensions(), (1430, 805));
+                    assert_eq!(processed.bytes.as_ref(), original_bytes);
+                }
+            }
+        }
+    }
+}
+
+#[tracing_test::traced_test]
+#[test]
+fn large_tool_output_png_uses_first_jpeg_quality_that_fits() {
+    let image = noise_image(1430, 805);
+    let original_bytes = image_bytes(&image, ImageFormat::Png);
+    assert!(original_bytes.len() > ORIGINAL_MAX_IMAGE_BYTES);
+    let url = data_url_from_bytes("image/png", &original_bytes);
+
+    let processed = load_data_url_for_prompt(
+        &url,
+        PromptImageMode::HIGH_DETAIL,
+        PromptImageTreatment::ToolOutput,
+    )
+    .expect("process tool image");
+    assert_eq!(processed.mime, "image/jpeg");
+    assert_eq!(
+        image::guess_format(&processed.bytes).unwrap(),
+        ImageFormat::Jpeg
+    );
+    assert_eq!(
+        image::load_from_memory(&processed.bytes)
+            .unwrap()
+            .dimensions(),
+        (1430, 805)
+    );
+    assert!(processed.bytes.len() <= ORIGINAL_MAX_IMAGE_BYTES);
+
+    let rgb = DynamicImage::ImageRgba8(image).into_rgb8();
+    for quality in [85, 70, 50] {
+        let mut candidate = Vec::new();
+        JpegEncoder::new_with_quality(&mut candidate, quality)
+            .encode_image(&rgb)
+            .expect("encode reference JPEG");
+        if candidate.len() <= ORIGINAL_MAX_IMAGE_BYTES {
+            assert!(quality < 85, "fixture must exercise JPEG quality fallback");
+            assert_eq!(processed.bytes.as_ref(), candidate);
+            assert!(logs_contain(&format!("quality={quality}")));
+            return;
+        }
+    }
+    panic!("fixture must fit at one of the JPEG quality steps");
+}
+
+#[test]
+fn large_tool_output_png_flattens_alpha_onto_white() {
+    let mut image = noise_image(1000, 1000);
+    for (x, _, pixel) in image.enumerate_pixels_mut() {
+        if x < 200 {
+            *pixel = Rgba([255, 0, 0, 0]);
+        } else if x < 400 {
+            *pixel = Rgba([0, 0, 0, 128]);
+        }
+    }
+    let mut exif = ROTATE_90_EXIF.to_vec();
+    exif.resize(66_000, 0);
+    let mut original_bytes = Vec::new();
+    let mut encoder = PngEncoder::new(&mut original_bytes);
+    encoder.set_exif_metadata(exif).expect("set long PNG EXIF");
+    encoder
+        .write_image(image.as_raw(), 1000, 1000, ColorType::Rgba8.into())
+        .expect("encode transparent PNG");
+    assert!(original_bytes.len() > ORIGINAL_MAX_IMAGE_BYTES);
+    let url = data_url_from_bytes("image/png", &original_bytes);
+
+    let processed = load_data_url_for_prompt(
+        &url,
+        PromptImageMode::ORIGINAL_DETAIL,
+        PromptImageTreatment::ToolOutput,
+    )
+    .expect("process tool image");
+    assert_eq!(processed.mime, "image/jpeg");
+    let decoded = image::load_from_memory(&processed.bytes).expect("decode JPEG");
+    assert_eq!(decoded.dimensions(), (1000, 1000));
+    assert_eq!(decoded.get_pixel(64, 64), Rgba([255, 255, 255, 255]));
+    assert_eq!(decoded.get_pixel(256, 64), Rgba([127, 127, 127, 255]));
+    let mut decoder = ImageReader::with_format(Cursor::new(&processed.bytes), ImageFormat::Jpeg)
+        .into_decoder()
+        .expect("create JPEG decoder");
+    assert_eq!(
+        decoder.orientation().expect("read EXIF orientation"),
+        Orientation::Rotate90
+    );
+}
+
+#[tracing_test::traced_test]
+#[test]
+fn tool_output_jpeg_over_budget_keeps_dimensions_and_warns_once() {
+    let image = noise_image(2048, 1248);
+    let original_bytes = image_bytes(&image, ImageFormat::Png);
+    let url = data_url_from_bytes("image/png", &original_bytes);
+
+    let processed = load_data_url_for_prompt(
+        &url,
+        PromptImageMode::HIGH_DETAIL,
+        PromptImageTreatment::ToolOutput,
+    )
+    .expect("process tool image");
+    assert_eq!(processed.mime, "image/jpeg");
+    assert_eq!(
+        image::load_from_memory(&processed.bytes)
+            .unwrap()
+            .dimensions(),
+        (2048, 1248)
+    );
+    assert!(processed.bytes.len() > ORIGINAL_MAX_IMAGE_BYTES);
+    logs_assert(|lines| {
+        let warnings: Vec<_> = lines
+            .iter()
+            .filter(|line| line.contains("tool output image still exceeds 1 MiB"))
+            .collect();
+        if warnings.len() == 1 && warnings[0].contains("WARN") && warnings[0].contains("quality=50")
+        {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected one warning at quality 50, got {warnings:?}"
+            ))
+        }
+    });
 }

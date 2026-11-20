@@ -50,6 +50,7 @@ use codex_protocol::protocol::Op;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::TokenUsage;
+use codex_utils_image::PromptImageTreatment;
 use futures::future::BoxFuture;
 use serde_json::Value;
 use tokio::sync::Mutex;
@@ -632,8 +633,12 @@ async fn run_review_on_session(
                         };
                         match image {
                             ImageReference::Inline { image_url } => {
-                                let prepared_image_url = match resize_image(image_url, detail, mode)
-                                {
+                                let prepared_image_url = match resize_image(
+                                    image_url,
+                                    detail,
+                                    mode,
+                                    PromptImageTreatment::Message,
+                                ) {
                                     Ok(Some(prepared)) => Cow::Owned(prepared.into_data_url()),
                                     Ok(None) => Cow::Borrowed(image_url),
                                     Err(error) => {

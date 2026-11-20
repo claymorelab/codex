@@ -20,10 +20,12 @@ codex-utils-cache = { workspace = true }
 mime_guess = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["fs", "rt", "rt-multi-thread", "macros"] }
+tracing = { workspace = true }
 
 [dev-dependencies]
 divan = { workspace = true }
 image = { workspace = true, features = ["jpeg", "png", "gif", "webp"] }
+tracing-test = { workspace = true }
 
 [lib]
 doctest = false

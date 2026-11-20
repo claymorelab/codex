@@ -173,6 +173,7 @@ async fn detail_policies_apply_the_expected_budgets() {
             (1024, 1024),
         ),
         (None, ImageDetailSetting::High, (2048, 2048), (1024, 1024)),
+        (None, ImageDetailSetting::High, (1430, 805), (1024, 576)),
     ] {
         let (image_url, _) = png_data_url(input_dimensions.0, input_dimensions.1);
         let mut items = vec![ResponseItem::Message {
@@ -227,7 +228,7 @@ async fn detail_policies_apply_the_expected_budgets() {
 #[tokio::test(flavor = "multi_thread")]
 async fn preparation_reports_tool_output_item_id() {
     let call_id = "call-image";
-    let (image_url, _) = png_data_url(/*width*/ 64, /*height*/ 32);
+    let (image_url, original_bytes) = png_data_url(/*width*/ 1430, /*height*/ 805);
     let mut items = vec![ResponseItem::FunctionCallOutput {
         id: None,
         call_id: Some(call_id.to_string()),
@@ -246,21 +247,39 @@ async fn preparation_reports_tool_output_item_id() {
         /*ephemeral*/ false,
         &mut items,
         ImagePreparationMode::DetailBased,
-        ImageResizeNoticeMode::Disabled,
+        ImageResizeNoticeMode::Enabled,
         &InlineAttachmentStore,
     )
     .await;
 
+    let [ResponseItem::FunctionCallOutput { output, .. }] = items.as_slice() else {
+        panic!("expected tool output without a resize notice");
+    };
+    let FunctionCallOutputBody::ContentItems(content) = &output.body else {
+        panic!("expected tool content");
+    };
+    let [
+        FunctionCallOutputContentItem::InputImage {
+            image: ImageReference::Inline { image_url },
+            detail: Some(ImageDetail::High),
+        },
+    ] = content.as_slice()
+    else {
+        panic!("expected a high-detail inline image");
+    };
+    let (bytes, image) = decoded_image(image_url);
+    assert_eq!(bytes, original_bytes);
+    assert_eq!(image.dimensions(), (1430, 805));
     assert_eq!(
         metadata,
         vec![ImagePreparationMetadata {
             message_role: None,
             item_id: Some(call_id.to_string()),
             effective_detail: ImageDetailSetting::High,
-            source_width: 64,
-            source_height: 32,
-            prepared_width: 64,
-            prepared_height: 32,
+            source_width: 1430,
+            source_height: 805,
+            prepared_width: 1430,
+            prepared_height: 805,
         }]
     );
 }
@@ -499,7 +518,7 @@ async fn resize_notices_count_file_backed_images_and_skip_failed_images() {
     assert_eq!(failed_tool_image, IMAGE_PROCESSING_ERROR_PLACEHOLDER);
     assert_eq!(
         decoded_image(resized_tool_image_url).1.dimensions(),
-        (1024, 1024)
+        (1600, 1600)
     );
     assert_eq!(
         &items[3],
@@ -509,7 +528,7 @@ async fn resize_notices_count_file_backed_images_and_skip_failed_images() {
             content: vec![ContentItem::InputText {
                 text: concat!(
                     "<image_resize_notice>\n",
-                    "Image 3 of 3 in the preceding tool output was resized from 2048x2048 to 1024x1024 pixels.\n",
+                    "Image 3 of 3 in the preceding tool output was resized from 2048x2048 to 1600x1600 pixels.\n",
                     "</image_resize_notice>"
                 )
                 .to_string(),
@@ -529,7 +548,7 @@ async fn resize_notices_count_file_backed_images_and_skip_failed_images() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn preparation_replaces_only_failed_tool_images_and_preserves_metadata() {
-    let (valid_image_url, _) = png_data_url(/*width*/ 64, /*height*/ 32);
+    let (valid_image_url, _) = png_data_url(/*width*/ 1430, /*height*/ 805);
     let expected_valid_image_url = valid_image_url.clone();
     let mut items = vec![ResponseItem::CustomToolCallOutput {
         id: None,

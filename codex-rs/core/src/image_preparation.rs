@@ -24,6 +24,7 @@ use codex_protocol::openai_models::ModelInfo;
 use codex_utils_image::EncodedImage;
 use codex_utils_image::ImageProcessingError;
 use codex_utils_image::PromptImageMode;
+use codex_utils_image::PromptImageTreatment;
 use codex_utils_image::data_url_from_bytes;
 use codex_utils_image::load_data_url_for_prompt;
 use tracing::warn;
@@ -269,7 +270,17 @@ async fn prepare_message_content(
     for item in items {
         if let ContentItem::InputImage { image, detail } = item.content_mut() {
             image_number += 1;
-            match prepare_image(image, detail, origin, metadata, mode, image_store).await {
+            match prepare_image(
+                image,
+                detail,
+                origin,
+                metadata,
+                mode,
+                PromptImageTreatment::Message,
+                image_store,
+            )
+            .await
+            {
                 Ok(Some(resize)) if resize_notice_mode == ImageResizeNoticeMode::Enabled => {
                     resized_images.push(ResizedImage {
                         image_number,
@@ -311,7 +322,17 @@ async fn prepare_tool_output_content(
     for item in items {
         if let FunctionCallOutputContentItem::InputImage { image, detail } = item {
             image_number += 1;
-            match prepare_image(image, detail, origin, metadata, mode, image_store).await {
+            match prepare_image(
+                image,
+                detail,
+                origin,
+                metadata,
+                mode,
+                PromptImageTreatment::ToolOutput,
+                image_store,
+            )
+            .await
+            {
                 Ok(Some(resize)) if resize_notice_mode == ImageResizeNoticeMode::Enabled => {
                     resized_images.push(ResizedImage {
                         image_number,
@@ -353,12 +374,13 @@ async fn prepare_image(
     origin: ImageOrigin<'_>,
     metadata: &mut Vec<ImagePreparationMetadata>,
     mode: ImagePreparationMode,
+    treatment: PromptImageTreatment,
     image_store: &dyn AttachmentStore,
 ) -> Result<Option<PreparedImageResize>, ImagePreparationError> {
     let ImageReference::Inline { image_url } = image else {
         return Ok(None);
     };
-    let Some(prepared) = resize_image(image_url, detail, mode)? else {
+    let Some(prepared) = resize_image(image_url, detail, mode, treatment)? else {
         return Ok(None);
     };
     metadata.push(prepared.metadata(origin));
@@ -388,6 +410,7 @@ pub(crate) fn resize_image(
     image_url: &str,
     detail: &mut Option<ImageDetail>,
     mode: ImagePreparationMode,
+    treatment: PromptImageTreatment,
 ) -> Result<Option<PreparedInlineImage>, ImagePreparationError> {
     if is_remote_image_url(image_url) {
         return Err(ImagePreparationError::RemoteUrlUnsupported);
@@ -412,7 +435,7 @@ pub(crate) fn resize_image(
             Some(ImageDetail::Low) => return Err(ImagePreparationError::UnsupportedLowDetail),
         },
     };
-    let encoded = load_data_url_for_prompt(image_url, image_mode)?;
+    let encoded = load_data_url_for_prompt(image_url, image_mode, treatment)?;
     let resize = ((encoded.source_width, encoded.source_height) != (encoded.width, encoded.height))
         .then_some(PreparedImageResize {
             source_width: encoded.source_width,

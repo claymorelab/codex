@@ -558,7 +558,7 @@ async fn view_image_tool_attaches_local_image() -> anyhow::Result<()> {
         &input[function_output_index + 1],
         concat!(
             "<image_resize_notice>\n",
-            "Image 1 of 1 in the preceding tool output was resized from 2304x864 to 1024x384 pixels.\n",
+            "Image 1 of 1 in the preceding tool output was resized from 2304x864 to 2048x768 pixels.\n",
             "</image_resize_notice>"
         ),
     );
@@ -577,7 +577,7 @@ async fn view_image_tool_attaches_local_image() -> anyhow::Result<()> {
         .expect("image data decodes from base64 for request");
     let resized = load_from_memory(&decoded).expect("load resized image");
     let (resized_width, resized_height) = resized.dimensions();
-    assert_eq!((resized_width, resized_height), (1024, 384));
+    assert_eq!((resized_width, resized_height), (2048, 768));
 
     Ok(())
 }
@@ -1170,7 +1170,7 @@ async fn view_image_tool_treats_null_detail_as_omitted() -> anyhow::Result<()> {
         .expect("image data decodes from base64 for request");
     let resized = load_from_memory(&decoded).expect("load resized image");
     let (width, height) = resized.dimensions();
-    assert_eq!((width, height), (1024, 384));
+    assert_eq!((width, height), (2048, 768));
 
     Ok(())
 }
@@ -1282,7 +1282,7 @@ async fn assert_view_image_tool_resizes_without_original_support(
         .expect("image data decodes from base64 for request");
     let resized = load_from_memory(&decoded).expect("load resized image");
     let (resized_width, resized_height) = resized.dimensions();
-    assert_eq!((resized_width, resized_height), (1024, 384));
+    assert_eq!((resized_width, resized_height), (2048, 768));
 
     Ok(())
 }
@@ -1373,7 +1373,7 @@ async fn view_image_tool_does_not_force_original_resolution_with_capability_only
         .expect("image data decodes from base64 for request");
     let resized = load_from_memory(&decoded).expect("load resized image");
     let (resized_width, resized_height) = resized.dimensions();
-    assert_eq!((resized_width, resized_height), (1024, 384));
+    assert_eq!((resized_width, resized_height), (2048, 768));
 
     Ok(())
 }

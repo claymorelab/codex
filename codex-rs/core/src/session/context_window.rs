@@ -7,8 +7,8 @@ use codex_protocol::openai_models::ModelInfo;
 /// Images a request may carry before auto-compaction runs, whatever its token count.
 /// An image costs few tokens but many bytes, so a screenshot-heavy context can outgrow
 /// a request size limit long before its token budget. The original Grok Bot compacts
-/// on image count the same way (`IMAGE_SUMMARIZATION_TRIGGER_COUNT`, 85); 24 keeps
-/// 1920x1080 PNG screenshots, about 1 MB each, under a 32 MB request body limit.
+/// on image count the same way (`IMAGE_SUMMARIZATION_TRIGGER_COUNT`, 85). At 1 MiB
+/// per image, 24 images use about 32 MiB after base64, before JSON and other content.
 pub(crate) const AUTO_COMPACT_IMAGE_LIMIT: usize = 24;
 
 #[derive(Debug)]
